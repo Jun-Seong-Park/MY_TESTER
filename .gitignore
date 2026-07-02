@@ -1,0 +1,23 @@
+# Build output
+/build/
+/Debug/
+/Release/
+cmake-build-*/
+
+# Compiled / linked artifacts
+*.o
+*.obj
+*.elf
+*.bin
+*.hex
+*.map
+*.list
+*.su
+*.d
+
+# STM32CubeMX / IDE
+*.launch
+
+# OS
+Thumbs.db
+.DS_Store

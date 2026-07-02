@@ -1,0 +1,22 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "J-Link Debug",
+            "type": "cortex-debug",
+            "request": "launch",
+            "servertype": "jlink",
+            "device": "STM32F401RC", // TODO: need to change when mcu diff
+            "interface": "swd",
+            "serverpath": "C:/Program Files (x86)/SEGGER/JLink/JLinkGDBServerCL.exe", // Need to change when SEGGER J-Link version or path diff
+            "executable": "${workspaceFolder}/build/Debug/MY_TESTER.elf", // TODO: need to change when project diff
+            "runToEntryPoint": "main",
+            "svdFile": "${workspaceFolder}/.vscode/STM32F401.svd", // need to change when board diff
+            "preLaunchTask": "CMake: Build Debug",     
+            "liveWatch": {
+                "enabled": true,
+                "samplesPerSecond": 4
+            }
+        }
+    ]
+}
