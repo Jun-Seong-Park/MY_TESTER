@@ -49,6 +49,8 @@ extern "C" {
 
 /* USER CODE END EM */
 
+void HAL_TIM_MspPostInit(TIM_HandleTypeDef *htim);
+
 /* Exported functions prototypes ---------------------------------------------*/
 void Error_Handler(void);
 
@@ -57,6 +59,18 @@ void Error_Handler(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
+#define BTN_LEFT_Pin GPIO_PIN_0
+#define BTN_LEFT_GPIO_Port GPIOC
+#define BTN_LEFT_EXTI_IRQn EXTI0_IRQn
+#define BTN_UP_Pin GPIO_PIN_3
+#define BTN_UP_GPIO_Port GPIOC
+#define BTN_UP_EXTI_IRQn EXTI3_IRQn
+#define BTN_RIGHT_Pin GPIO_PIN_1
+#define BTN_RIGHT_GPIO_Port GPIOB
+#define BTN_RIGHT_EXTI_IRQn EXTI1_IRQn
+#define BTN_DOWN_Pin GPIO_PIN_2
+#define BTN_DOWN_GPIO_Port GPIOB
+#define BTN_DOWN_EXTI_IRQn EXTI2_IRQn
 
 /* USER CODE BEGIN Private defines */
 

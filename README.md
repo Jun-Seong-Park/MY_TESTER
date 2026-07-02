@@ -1,6 +1,6 @@
 # MY_TESTER
 
-Firmware for the **Byrobot All Tester** board, built around an **STM32F401RCT6**
+Firmware for the **All Tester** board, built around an **STM32F401RCT6**
 (LQFP-64, Arm Cortex-M4). Powered from a single USB-C input (J101).
 
 This is a personal study project: I use it to learn STM32 development hands-on,

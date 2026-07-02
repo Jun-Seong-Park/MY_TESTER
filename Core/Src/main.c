@@ -21,17 +21,38 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include <stdio.h>
+#include <string.h>
+#include "uc1701x.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+/* 버튼 1개의 결선/이름 기술자 */
+typedef struct
+{
+  GPIO_TypeDef *port;
+  uint16_t      pin;
+  const char   *name;
+} button_desc_t;
 
+/* EXTI ISR -> 메인 루프로 전달되는 버튼 이벤트 */
+typedef struct
+{
+  uint8_t index;   /* buttons[] 인덱스 */
+  uint8_t pressed; /* 1 = 눌림, 0 = 뗌 */
+} button_event_t;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define BTN_COUNT        4U
+#define BTN_DEBOUNCE_MS  30U   /* 이 시간 안의 재에지는 채터링으로 간주 */
+#define BTN_QUEUE_LEN    16U
+#define BTN_RECONCILE_MS 50U   /* 디바운스 창에서 놓친 마지막 에지의 주기 보정 */
+#define LED_BLINK_MS     500U  /* GREEN 하트비트 토글 주기 */
+#define UART_RX_BUF_LEN  64U
+#define LCD_HELLO_TEXT   "Hello World!"
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -44,6 +65,8 @@ ADC_HandleTypeDef hadc1;
 
 SPI_HandleTypeDef hspi1;
 
+TIM_HandleTypeDef htim2;
+
 UART_HandleTypeDef huart2;
 DMA_HandleTypeDef hdma_usart2_rx;
 DMA_HandleTypeDef hdma_usart2_tx;
@@ -51,7 +74,28 @@ DMA_HandleTypeDef hdma_usart2_tx;
 PCD_HandleTypeDef hpcd_USB_OTG_FS;
 
 /* USER CODE BEGIN PV */
+static const button_desc_t buttons[BTN_COUNT] =
+{
+  { BTN_LEFT_GPIO_Port,  BTN_LEFT_Pin,  "LEFT"  },
+  { BTN_RIGHT_GPIO_Port, BTN_RIGHT_Pin, "RIGHT" },
+  { BTN_DOWN_GPIO_Port,  BTN_DOWN_Pin,  "DOWN"  },
+  { BTN_UP_GPIO_Port,    BTN_UP_Pin,    "UP"    },
+};
 
+/* 버튼 회로(풀 방향/액티브 레벨)가 LCD 모듈 쪽이라 미상이므로,
+ * 부팅 시 관측한 레벨을 "안 눌림" 기준으로 삼고 그 반대를 "눌림"으로 판정 */
+static GPIO_PinState    btn_idle_level[BTN_COUNT];
+static volatile uint8_t btn_pressed[BTN_COUNT];
+static volatile uint32_t btn_last_edge_tick[BTN_COUNT];
+
+/* 단일 생산자(EXTI ISR) / 단일 소비자(메인 루프) 링 버퍼 */
+static volatile button_event_t btn_queue[BTN_QUEUE_LEN];
+static volatile uint8_t btn_queue_head;
+static volatile uint8_t btn_queue_tail;
+
+static volatile uint8_t cmd_led_blink = 1U; /* PC 명령 'r'=1 / 's'=0 */
+
+static uint8_t uart_rx_buf[UART_RX_BUF_LEN]; /* USART2 DMA circular 수신 버퍼 */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -62,8 +106,10 @@ static void MX_ADC1_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_SPI1_Init(void);
 static void MX_USB_OTG_FS_PCD_Init(void);
+static void MX_TIM2_Init(void);
 /* USER CODE BEGIN PFP */
-
+static void uart_send_line(const char *line);
+static void app_report_button(uint8_t index, uint8_t pressed);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -105,8 +151,47 @@ int main(void)
   MX_USART2_UART_Init();
   MX_SPI1_Init();
   MX_USB_OTG_FS_PCD_Init();
+  MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
+  /* LCD 백라이트: TIM2_CH1 PWM 시작, 듀티 100% (극성 미상 -> 실물 관측 후 조정) */
+  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
+  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, 999U);
 
+  /* LCD (JLX12864G-0088 / UC1701X) 초기화 + Hello World! */
+  uc1701x_init(&hspi1);
+  uc1701x_clear();
+  /* 12자 x 6px = 72px -> x = (128 - 72) / 2 = 28 (page 2 = 세로 중앙 부근) */
+  uc1701x_draw_string(2U, 28U, LCD_HELLO_TEXT);
+
+  /* 버튼 idle(안 눌림) 레벨 관측 - 이후 "눌림 = idle 과 다른 레벨" 로 판정 */
+  for (uint8_t i = 0U; i < BTN_COUNT; i++)
+  {
+    btn_idle_level[i] = HAL_GPIO_ReadPin(buttons[i].port, buttons[i].pin);
+    btn_pressed[i] = 0U;
+    btn_last_edge_tick[i] = 0U;
+  }
+
+  /* USART2 수신 시작: DMA circular + IDLE 라인 이벤트 */
+  if (HAL_UARTEx_ReceiveToIdle_DMA(&huart2, uart_rx_buf, UART_RX_BUF_LEN) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /* 부팅 배너 + 실측 보고 (버튼 풀 방향 검증용) */
+  uart_send_line("BOOT,MY_TESTER,SYSCLK=84MHz\r\n");
+  {
+    char boot_line[64];
+    (void)snprintf(boot_line, sizeof(boot_line),
+                   "BTNIDLE,LEFT=%d,RIGHT=%d,DOWN=%d,UP=%d\r\n",
+                   (int)btn_idle_level[0], (int)btn_idle_level[1],
+                   (int)btn_idle_level[2], (int)btn_idle_level[3]);
+    uart_send_line(boot_line);
+  }
+  uart_send_line("LCD," LCD_HELLO_TEXT "\r\n");
+
+  uint32_t last_blink_tick = HAL_GetTick();
+  uint32_t last_reconcile_tick = HAL_GetTick();
+  uint8_t  led_green_on = 0U;
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -116,6 +201,56 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    uint32_t now = HAL_GetTick();
+
+    /* 1) EXTI ISR 이 큐에 넣은 버튼 이벤트 소비 -> UART 보고 + RED LED + LCD */
+    while (btn_queue_tail != btn_queue_head)
+    {
+      button_event_t evt;
+      evt.index   = btn_queue[btn_queue_tail].index;
+      evt.pressed = btn_queue[btn_queue_tail].pressed;
+      btn_queue_tail = (uint8_t)((btn_queue_tail + 1U) % BTN_QUEUE_LEN);
+      app_report_button(evt.index, evt.pressed);
+    }
+
+    /* 2) 주기 보정: 디바운스 창 안에서 마지막 에지를 놓친 경우 실제 레벨로 복구 */
+    if ((now - last_reconcile_tick) >= BTN_RECONCILE_MS)
+    {
+      last_reconcile_tick = now;
+      for (uint8_t i = 0U; i < BTN_COUNT; i++)
+      {
+        if ((now - btn_last_edge_tick[i]) < BTN_DEBOUNCE_MS)
+        {
+          continue; /* 아직 안정화 전이면 판단 보류 */
+        }
+        GPIO_PinState level = HAL_GPIO_ReadPin(buttons[i].port, buttons[i].pin);
+        uint8_t pressed = (level != btn_idle_level[i]) ? 1U : 0U;
+        if (pressed != btn_pressed[i])
+        {
+          btn_pressed[i] = pressed;
+          app_report_button(i, pressed);
+        }
+      }
+    }
+
+    /* 3) GREEN LED 하트비트 - PC 명령 'r'(run)/'s'(stop) 로 제어 */
+    if ((cmd_led_blink != 0U) && ((now - last_blink_tick) >= LED_BLINK_MS))
+    {
+      last_blink_tick = now;
+      led_green_on ^= 1U;
+      HAL_GPIO_WritePin(GPIOC, GPIO_PIN_14,
+                        (led_green_on != 0U) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+      char led_line[24];
+      (void)snprintf(led_line, sizeof(led_line), "LED,GREEN,%u\r\n",
+                     (unsigned int)led_green_on);
+      uart_send_line(led_line);
+    }
+    if ((cmd_led_blink == 0U) && (led_green_on != 0U))
+    {
+      led_green_on = 0U;
+      HAL_GPIO_WritePin(GPIOC, GPIO_PIN_14, GPIO_PIN_RESET);
+      uart_send_line("LED,GREEN,0\r\n");
+    }
   }
   /* USER CODE END 3 */
 }
@@ -240,7 +375,7 @@ static void MX_SPI1_Init(void)
   hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
   hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
   hspi1.Init.NSS = SPI_NSS_SOFT;
-  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_2;
+  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_32;
   hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
   hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
   hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
@@ -252,6 +387,65 @@ static void MX_SPI1_Init(void)
   /* USER CODE BEGIN SPI1_Init 2 */
 
   /* USER CODE END SPI1_Init 2 */
+
+}
+
+/**
+  * @brief TIM2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM2_Init(void)
+{
+
+  /* USER CODE BEGIN TIM2_Init 0 */
+
+  /* USER CODE END TIM2_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+
+  /* USER CODE BEGIN TIM2_Init 1 */
+
+  /* USER CODE END TIM2_Init 1 */
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 83;
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 999;
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_Init(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 0;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM2_Init 2 */
+
+  /* USER CODE END TIM2_Init 2 */
+  HAL_TIM_MspPostInit(&htim2);
 
 }
 
@@ -362,8 +556,8 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOD_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13|GPIO_PIN_14|GPIO_PIN_0|GPIO_PIN_1
-                          |GPIO_PIN_2|GPIO_PIN_3|GPIO_PIN_6|GPIO_PIN_7, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13|GPIO_PIN_14|GPIO_PIN_1|GPIO_PIN_2
+                          |GPIO_PIN_6|GPIO_PIN_7, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10|GPIO_PIN_4, GPIO_PIN_RESET);
@@ -374,14 +568,26 @@ static void MX_GPIO_Init(void)
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOD, GPIO_PIN_2, GPIO_PIN_RESET);
 
-  /*Configure GPIO pins : PC13 PC14 PC0 PC1
-                           PC2 PC3 PC6 PC7 */
-  GPIO_InitStruct.Pin = GPIO_PIN_13|GPIO_PIN_14|GPIO_PIN_0|GPIO_PIN_1
-                          |GPIO_PIN_2|GPIO_PIN_3|GPIO_PIN_6|GPIO_PIN_7;
+  /*Configure GPIO pins : PC13 PC14 PC1 PC2
+                           PC6 PC7 */
+  GPIO_InitStruct.Pin = GPIO_PIN_13|GPIO_PIN_14|GPIO_PIN_1|GPIO_PIN_2
+                          |GPIO_PIN_6|GPIO_PIN_7;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : BTN_LEFT_Pin BTN_UP_Pin */
+  GPIO_InitStruct.Pin = BTN_LEFT_Pin|BTN_UP_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING_FALLING;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : BTN_RIGHT_Pin BTN_DOWN_Pin */
+  GPIO_InitStruct.Pin = BTN_RIGHT_Pin|BTN_DOWN_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING_FALLING;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
   /*Configure GPIO pins : PB10 PB4 */
   GPIO_InitStruct.Pin = GPIO_PIN_10|GPIO_PIN_4;
@@ -435,14 +641,6 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : PA15 */
-  GPIO_InitStruct.Pin = GPIO_PIN_15;
-  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  GPIO_InitStruct.Alternate = GPIO_AF1_TIM2;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-
   /*Configure GPIO pins : PC10 PC11 PC12 */
   GPIO_InitStruct.Pin = GPIO_PIN_10|GPIO_PIN_11|GPIO_PIN_12;
   GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
@@ -474,13 +672,124 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Alternate = GPIO_AF4_I2C1;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
+  /* EXTI interrupt init*/
+  HAL_NVIC_SetPriority(EXTI0_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(EXTI0_IRQn);
+
+  HAL_NVIC_SetPriority(EXTI1_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(EXTI1_IRQn);
+
+  HAL_NVIC_SetPriority(EXTI2_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(EXTI2_IRQn);
+
+  HAL_NVIC_SetPriority(EXTI3_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(EXTI3_IRQn);
+
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
   /* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
+/* 한 줄 송신 (블로킹). ISR 에서 호출 금지 - 메인 루프 전용 */
+static void uart_send_line(const char *line)
+{
+  (void)HAL_UART_Transmit(&huart2, (const uint8_t *)line,
+                          (uint16_t)strlen(line), 100U);
+}
 
+/* 버튼 이벤트 1건 처리: RED LED 갱신 + UART 보고 + LCD 2번째 줄 갱신 */
+static void app_report_button(uint8_t index, uint8_t pressed)
+{
+  char line[32];
+
+  /* RED LED = 하나라도 눌려 있으면 ON (논리 상태 기준, 극성은 실물로 확인) */
+  uint8_t any_pressed = 0U;
+  for (uint8_t i = 0U; i < BTN_COUNT; i++)
+  {
+    any_pressed |= btn_pressed[i];
+  }
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13,
+                    (any_pressed != 0U) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+
+  (void)snprintf(line, sizeof(line), "BTN,%s,%u\r\n",
+                 buttons[index].name, (unsigned int)pressed);
+  uart_send_line(line);
+  (void)snprintf(line, sizeof(line), "LED,RED,%u\r\n",
+                 (unsigned int)any_pressed);
+  uart_send_line(line);
+
+  /* LCD: "BTN: LEFT  DOWN" 형식, 15자 x 6px = 90px -> x = 19 로 중앙 정렬 */
+  (void)snprintf(line, sizeof(line), "BTN: %-5s %s",
+                 buttons[index].name, (pressed != 0U) ? "DOWN" : "UP  ");
+  uc1701x_draw_string(5U, 19U, line);
+}
+
+/* EXTI 콜백: it.c 의 EXTI0~3 핸들러 -> HAL_GPIO_EXTI_IRQHandler 경유로 호출됨.
+ * ISR 컨텍스트이므로 최소 작업만: 디바운스 판정 + 상태 갱신 + 큐에 push */
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+  uint32_t now = HAL_GetTick();
+
+  for (uint8_t i = 0U; i < BTN_COUNT; i++)
+  {
+    if (GPIO_Pin != buttons[i].pin)
+    {
+      continue;
+    }
+    if ((now - btn_last_edge_tick[i]) < BTN_DEBOUNCE_MS)
+    {
+      return; /* 채터링: 무시 (놓친 최종 상태는 주기 보정이 복구) */
+    }
+    btn_last_edge_tick[i] = now;
+
+    GPIO_PinState level = HAL_GPIO_ReadPin(buttons[i].port, buttons[i].pin);
+    uint8_t pressed = (level != btn_idle_level[i]) ? 1U : 0U;
+    if (pressed == btn_pressed[i])
+    {
+      return; /* 상태 변화 없음 */
+    }
+    btn_pressed[i] = pressed;
+
+    uint8_t next_head = (uint8_t)((btn_queue_head + 1U) % BTN_QUEUE_LEN);
+    if (next_head != btn_queue_tail) /* 큐 가득 참 -> 이벤트 버림 (덮어쓰기 방지) */
+    {
+      btn_queue[btn_queue_head].index   = i;
+      btn_queue[btn_queue_head].pressed = pressed;
+      btn_queue_head = next_head;
+    }
+    return;
+  }
+}
+
+/* USART2 수신 이벤트 (DMA circular + IDLE): PC 명령 파싱.
+ * ISR 컨텍스트이므로 플래그만 갱신하고 무거운 일은 하지 않음 */
+void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
+{
+  static uint16_t rx_pos = 0U;
+
+  if (huart->Instance != USART2)
+  {
+    return;
+  }
+
+  /* Size 는 DMA 버퍼 내 현재 위치(버퍼 끝이면 LEN) -> 링 인덱스로 정규화 */
+  const uint16_t end_pos = (uint16_t)(Size % UART_RX_BUF_LEN);
+  while (rx_pos != end_pos)
+  {
+    uint8_t byte = uart_rx_buf[rx_pos];
+    rx_pos = (uint16_t)((rx_pos + 1U) % UART_RX_BUF_LEN);
+
+    if (byte == (uint8_t)'s')
+    {
+      cmd_led_blink = 0U;
+    }
+    else if (byte == (uint8_t)'r')
+    {
+      cmd_led_blink = 1U;
+    }
+  }
+}
 /* USER CODE END 4 */
 
 /**
